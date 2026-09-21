@@ -75,6 +75,22 @@ class DetectRequest(BaseModel):
         le=10_000,
         description="合并异常区间时允许桥接的连续正常点数",
     )
+    baseline_policy: Literal["rolling", "guarded"] = Field(
+        default="rolling",
+        description=(
+            "基线策略：rolling=原始滑动窗口（默认，异常点也会滑入窗口）；"
+            "guarded=仅正常点进入后续基线，连续异常达到 rebase_after 时重建基线"
+        ),
+    )
+    rebase_after: int | None = Field(
+        default=None,
+        ge=1,
+        le=10_000,
+        description=(
+            "guarded 模式下连续异常达到该点数即重建基线，必须不小于 min_window；"
+            "默认取 min_window。rolling 模式下忽略。"
+        ),
+    )
     include_points: bool = Field(
         default=False, description="响应是否包含逐点注解（存储中始终保留）"
     )
@@ -83,6 +99,8 @@ class DetectRequest(BaseModel):
     def _check_windows(self) -> "DetectRequest":
         if self.min_window > self.window_size:
             raise ValueError("min_window 不能大于 window_size")
+        if self.rebase_after is not None and self.rebase_after < self.min_window:
+            raise ValueError("rebase_after 不能小于 min_window")
         if len(self.points) <= self.min_window:
             raise ValueError(
                 f"至少需要 {self.min_window + 1} 个点（min_window={self.min_window}），"
@@ -149,6 +167,21 @@ class AnnotatedPoint(BaseModel):
     zscore: float
     degenerate_baseline: bool
     is_anomaly: bool
+    # 历史记录（升级前入库）可能缺少代次字段，按 rolling 语义给默认值
+    baseline_generation: int = Field(
+        default=0,
+        description=(
+            "评分该点所用基线的代次：初始为 0；guarded 模式每重建一次基线 +1。"
+            "rolling 模式恒为 0。"
+        ),
+    )
+    baseline_reset: bool = Field(
+        default=False,
+        description=(
+            "该点是否为 guarded 模式的基线重建触发点（连续异常达到 rebase_after）；"
+            "触发点本身仍计为异常。rolling 模式恒为 false。"
+        ),
+    )
 
 
 class DetectSummary(BaseModel):
@@ -157,6 +190,15 @@ class DetectSummary(BaseModel):
     min_window: int
     threshold: float
     merge_gap: int
+    # 历史记录（升级前入库）可能缺少策略字段，按 rolling 语义给默认值
+    baseline_policy: Literal["rolling", "guarded"] = "rolling"
+    rebase_after: int | None = Field(
+        default=None,
+        description="guarded 模式实际生效的重建阈值（未显式传参时取 min_window）；rolling 模式为 null",
+    )
+    baseline_rebuild_count: int = Field(
+        default=0, description="guarded 模式基线重建次数；rolling 模式为 0"
+    )
     evaluated_start_index: int
     evaluated_point_count: int
     anomaly_point_count: int

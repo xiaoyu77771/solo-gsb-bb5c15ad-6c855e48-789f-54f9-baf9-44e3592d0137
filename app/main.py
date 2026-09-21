@@ -70,6 +70,8 @@ def create_detection(req: DetectRequest) -> dict:
         min_window=req.min_window,
         threshold=req.threshold,
         merge_gap=req.merge_gap,
+        baseline_policy=req.baseline_policy,
+        rebase_after=req.rebase_after,
     )
 
     detection_id = uuid.uuid4().hex
@@ -78,6 +80,8 @@ def create_detection(req: DetectRequest) -> dict:
         "min_window": req.min_window,
         "threshold": req.threshold,
         "merge_gap": req.merge_gap,
+        "baseline_policy": req.baseline_policy,
+        "rebase_after": req.rebase_after,
         "point_count": len(req.points),
     }
     created_at = database.insert_detection(detection_id, req.series_id, request_params, result)

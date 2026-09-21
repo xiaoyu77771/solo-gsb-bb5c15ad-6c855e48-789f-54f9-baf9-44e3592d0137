@@ -8,11 +8,21 @@
    当 |z| >= threshold 时标记为异常点（突变 / 水平偏移）。
 3. 允许把相邻异常点之间至多 ``merge_gap`` 个正常点桥接，合并成异常区间。
 4. 每个异常区间给出基线、分数与触发点的人类可读解释。
+
+基线策略（``baseline_policy``）：
+- ``rolling``（默认）：原始滑动窗口，异常点也会随窗口滑入后续基线，
+  结果与早期版本完全一致。
+- ``guarded``：只有判为正常的点才允许进入后续滑动基线，孤立尖刺不会
+  污染其后的中位数与离散度；当连续异常点数达到 ``rebase_after``（不小于
+  ``min_window``）时，认为发生了真实水平切换，用该异常段最近
+  ``min_window`` 个点重建基线并把基线代次（generation）加一。重建触发点
+  仍保持异常，重建也不会拆分原异常区间。
 """
 
 from __future__ import annotations
 
 import math
+from collections import deque
 from statistics import median
 from typing import Any
 
@@ -20,6 +30,10 @@ from typing import Any
 MAD_SCALE = 1.4826
 # 基线恒定时（MAD=0 且标准差=0）又与基线不一致，使用的有限大 z 分数哨兵值
 ZERO_MAD_ZSCORE = 999.0
+
+# 支持的基线策略
+POLICY_ROLLING = "rolling"
+POLICY_GUARDED = "guarded"
 
 
 def _sample_std(values: list[float], mean: float) -> float:
@@ -63,27 +77,118 @@ def analyze_series(
     min_window: int = 5,
     threshold: float = 3.0,
     merge_gap: int = 2,
+    baseline_policy: str = POLICY_ROLLING,
+    rebase_after: int | None = None,
 ) -> dict[str, Any]:
     """执行检测并返回可 JSON 序列化的完整结果。
 
     :param timestamps: 已排序、已去重的 ISO-8601 时间戳字符串
     :param values: 与 timestamps 对齐的数值
+    :param baseline_policy: ``rolling``（默认）或 ``guarded``
+    :param rebase_after: guarded 模式下连续异常达到该点数即重建基线；
+           默认取 ``min_window``；必须不小于 ``min_window``。rolling 模式忽略。
     """
     n = len(values)
     # 每个被评估点的注解；前 min_window 个点没有足够基线，不参与评估
     annotations: list[dict[str, Any] | None] = [None] * n
     is_anomaly = [False] * n
     zscores: list[float | None] = [None] * n
+    # 每个被评估点实际使用的基线窗口索引（区间解释时复用，保证与逐点评分一致）
+    baseline_refs: list[list[int] | None] = [None] * n
 
     evaluated_start = min_window
+
+    if baseline_policy == POLICY_GUARDED:
+        effective_rebase = min_window if rebase_after is None else rebase_after
+        rebuild_count = _run_guarded(
+            timestamps=timestamps,
+            values=values,
+            window_size=window_size,
+            min_window=min_window,
+            threshold=threshold,
+            rebase_after=effective_rebase,
+            annotations=annotations,
+            is_anomaly=is_anomaly,
+            zscores=zscores,
+            baseline_refs=baseline_refs,
+        )
+        summary_rebase_after: int | None = effective_rebase
+    else:
+        _run_rolling(
+            timestamps=timestamps,
+            values=values,
+            window_size=window_size,
+            min_window=min_window,
+            threshold=threshold,
+            annotations=annotations,
+            is_anomaly=is_anomaly,
+            zscores=zscores,
+            baseline_refs=baseline_refs,
+        )
+        rebuild_count = 0
+        summary_rebase_after = None
+
+    segments = _build_segments(
+        timestamps=timestamps,
+        values=values,
+        is_anomaly=is_anomaly,
+        zscores=zscores,
+        annotations=annotations,
+        baseline_refs=baseline_refs,
+        window_size=window_size,
+        threshold=threshold,
+        merge_gap=merge_gap,
+        evaluated_start=evaluated_start,
+        baseline_policy=baseline_policy,
+        rebase_after=summary_rebase_after,
+    )
+
+    return {
+        "point_count": n,
+        "window_size": window_size,
+        "min_window": min_window,
+        "threshold": threshold,
+        "merge_gap": merge_gap,
+        "baseline_policy": baseline_policy,
+        "rebase_after": summary_rebase_after,
+        "baseline_rebuild_count": rebuild_count,
+        "evaluated_start_index": evaluated_start,
+        "evaluated_point_count": max(0, n - evaluated_start),
+        "anomaly_point_count": sum(1 for i in range(evaluated_start, n) if is_anomaly[i]),
+        "anomaly_segment_count": len(segments),
+        "segments": segments,
+        "points": [annotations[i] for i in range(evaluated_start, n)],
+    }
+
+
+def _run_rolling(
+    *,
+    timestamps: list[str],
+    values: list[float],
+    window_size: int,
+    min_window: int,
+    threshold: float,
+    annotations: list[dict[str, Any] | None],
+    is_anomaly: list[bool],
+    zscores: list[float | None],
+    baseline_refs: list[list[int] | None],
+) -> None:
+    """原始滑动窗口评分：所有历史点（含异常点）都随窗口进入基线。
+
+    数值结果与历史版本完全一致；额外记录基线代次（恒为 0）/ 重建标记（恒为
+    False）/ 实际基线窗口索引，仅用于统一输出结构。
+    """
+    n = len(values)
     for i in range(min_window, n):
         lo = max(0, i - window_size)
-        history = values[lo:i]
+        refs = list(range(lo, i))
+        history = [values[k] for k in refs]
         med, mad, robust_sd, dispersion_method = _window_stats(history)
         z, degenerate = _zscore(values[i], med, robust_sd)
         zscores[i] = z
         is_anomaly[i] = abs(z) >= threshold
 
+        baseline_refs[i] = refs
         annotations[i] = {
             "index": i,
             "timestamp": timestamps[i],
@@ -95,33 +200,85 @@ def analyze_series(
             "zscore": z,
             "degenerate_baseline": degenerate,
             "is_anomaly": is_anomaly[i],
+            "baseline_generation": 0,
+            "baseline_reset": False,
         }
 
-    segments = _build_segments(
-        timestamps=timestamps,
-        values=values,
-        is_anomaly=is_anomaly,
-        zscores=zscores,
-        annotations=annotations,
-        window_size=window_size,
-        threshold=threshold,
-        merge_gap=merge_gap,
-        evaluated_start=evaluated_start,
-    )
 
-    return {
-        "point_count": n,
-        "window_size": window_size,
-        "min_window": min_window,
-        "threshold": threshold,
-        "merge_gap": merge_gap,
-        "evaluated_start_index": evaluated_start,
-        "evaluated_point_count": max(0, n - evaluated_start),
-        "anomaly_point_count": sum(1 for i in range(evaluated_start, n) if is_anomaly[i]),
-        "anomaly_segment_count": len(segments),
-        "segments": segments,
-        "points": [annotations[i] for i in range(evaluated_start, n)],
-    }
+def _run_guarded(
+    *,
+    timestamps: list[str],
+    values: list[float],
+    window_size: int,
+    min_window: int,
+    threshold: float,
+    rebase_after: int,
+    annotations: list[dict[str, Any] | None],
+    is_anomaly: list[bool],
+    zscores: list[float | None],
+    baseline_refs: list[list[int] | None],
+) -> int:
+    """guarded 评分，返回基线重建次数。
+
+    规则：
+    - 基线池只纳入判为正常的点；异常点（孤立尖刺）永不进入后续基线。
+    - 维护当前连续异常段；长度达到 ``rebase_after`` 时，用该段最近
+      ``min_window`` 个点重建基线池，代次 +1；触发点仍标记为异常。
+    """
+    n = len(values)
+    # 当前基线池：只含正常点（或重建时被选为新基线的异常段尾部），
+    # 容量上限 window_size（重建后至少有 min_window 个点）。
+    pool: deque[int] = deque(range(min_window), maxlen=window_size)
+    generation = 0
+    run: list[int] = []  # 当前连续异常段的索引
+    rebuild_count = 0
+
+    for i in range(min_window, n):
+        # 评分前的基线窗口（重建发生在评分之后，不影响本点）
+        refs = list(pool)
+        history = [values[k] for k in refs]
+        med, mad, robust_sd, dispersion_method = _window_stats(history)
+        z, degenerate = _zscore(values[i], med, robust_sd)
+        zscores[i] = z
+        point_is_anomaly = abs(z) >= threshold
+        is_anomaly[i] = point_is_anomaly
+
+        # 本点使用的是重建前的代次；重建标记落在触发点上
+        point_generation = generation
+        reset = False
+
+        if point_is_anomaly:
+            run.append(i)
+            if len(run) >= rebase_after:
+                # 连续异常达到阈值：视为真实水平切换，用异常段最近
+                # min_window 个点重建基线（rebase_after >= min_window）
+                pool = deque(run[-min_window:], maxlen=window_size)
+                generation += 1
+                rebuild_count += 1
+                reset = True
+                run = []
+        else:
+            # 只有正常点才能进入后续滑动基线
+            run = []
+            pool.append(i)
+
+        baseline_refs[i] = refs
+        annotations[i] = {
+            "index": i,
+            "timestamp": timestamps[i],
+            "value": values[i],
+            "baseline_median": med,
+            "baseline_mad": mad,
+            "baseline_robust_sd": robust_sd,
+            "dispersion_method": dispersion_method,
+            "zscore": z,
+            "degenerate_baseline": degenerate,
+            "is_anomaly": point_is_anomaly,
+            "baseline_generation": point_generation,
+            "baseline_reset": reset,
+        }
+
+    return rebuild_count
 
 
 def _build_segments(
@@ -131,10 +288,13 @@ def _build_segments(
     is_anomaly: list[bool],
     zscores: list[float | None],
     annotations: list[dict[str, Any] | None],
+    baseline_refs: list[list[int] | None],
     window_size: int,
     threshold: float,
     merge_gap: int,
     evaluated_start: int,
+    baseline_policy: str,
+    rebase_after: int | None,
 ) -> list[dict[str, Any]]:
     """扫描异常布尔序列，按 merge_gap 合并相邻异常点为区间。"""
     n = len(values)
@@ -165,8 +325,10 @@ def _build_segments(
                 is_anomaly=is_anomaly,
                 zscores=zscores,
                 annotations=annotations,
-                window_size=window_size,
+                baseline_refs=baseline_refs,
                 threshold=threshold,
+                baseline_policy=baseline_policy,
+                rebase_after=rebase_after,
             )
         )
         i = seg_end + 1
@@ -183,14 +345,17 @@ def _describe_segment(
     is_anomaly: list[bool],
     zscores: list[float | None],
     annotations: list[dict[str, Any] | None],
-    window_size: int,
+    baseline_refs: list[list[int] | None],
     threshold: float,
+    baseline_policy: str,
+    rebase_after: int | None,
 ) -> dict[str, Any]:
     """构造单个异常区间：基线、分数、触发点与解释。"""
-    # 区间基线取第一个触发点的 trailing window（突变发生前的基线）
-    base_lo = max(0, seg_start - window_size)
-    base_hi = seg_start
-    baseline = [values[k] for k in range(base_lo, base_hi)]
+    # 区间基线取第一个触发点评分时实际使用的基线窗口（突变发生前的基线；
+    # guarded 模式下可能来自更早代次的正常点池）
+    base_indices = baseline_refs[seg_start]
+    assert base_indices is not None
+    baseline = [values[k] for k in base_indices]
     med, mad, robust_sd, dispersion_method = _window_stats(baseline)
 
     trigger_indices = [k for k in range(seg_start, seg_end + 1) if is_anomaly[k]]
@@ -254,6 +419,21 @@ def _describe_segment(
         f"平均 |z|={mean_abs_z:.2f}，判定阈值 {threshold:g}。"
     )
 
+    if baseline_policy == POLICY_GUARDED:
+        # guarded 模式补充基线代次 / 重建信息（不影响区间边界：重建不拆区间）
+        seg_resets = [
+            k
+            for k in range(seg_start, seg_end + 1)
+            if ann_is_reset(annotations[k])
+        ]
+        gen_start = ann_generation(annotations[seg_start])
+        gen_end = ann_generation(annotations[seg_end])
+        explanation += (
+            f"guarded 模式下本区间内基线共重建 {len(seg_resets)} 次"
+            f"（连续异常每达 {rebase_after} 个点触发一次，重建触发点仍计为异常），"
+            f"评分基线由第 {gen_start} 代推进至第 {gen_end} 代，区间未因重建而拆分。"
+        )
+
     return {
         "start_index": seg_start,
         "end_index": seg_end,
@@ -268,8 +448,8 @@ def _describe_segment(
             "dispersion_method": dispersion_method,
             "scale": MAD_SCALE,
             "window_size": len(baseline),
-            "window_start_time": timestamps[base_lo],
-            "window_end_time": timestamps[base_hi - 1],
+            "window_start_time": timestamps[base_indices[0]],
+            "window_end_time": timestamps[base_indices[-1]],
         },
         "score": {
             "max_abs_zscore": abs(max_z),
@@ -281,3 +461,14 @@ def _describe_segment(
         "triggers": triggers,
         "explanation": explanation,
     }
+
+
+def ann_is_reset(ann: dict[str, Any] | None) -> bool:
+    """读取注解上的基线重建标记（None 表示该点未参与评估）。"""
+    return bool(ann and ann["baseline_reset"])
+
+
+def ann_generation(ann: dict[str, Any] | None) -> int:
+    """读取注解上的基线代次（None 表示该点未参与评估）。"""
+    assert ann is not None
+    return int(ann["baseline_generation"])
