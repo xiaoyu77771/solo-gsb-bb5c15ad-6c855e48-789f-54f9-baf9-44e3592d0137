@@ -68,6 +68,89 @@ def test_no_anomaly() -> None:
     print("✓ 无异常数据正确返回空区间")
 
 
+def test_rolling_defaults_unchanged() -> None:
+    """rolling（默认）结果保持原有行为，新增字段取默认值。"""
+    values = [10.0 + (0.1 if i % 2 == 0 else -0.1) for i in range(30)]
+    values[10] = 20.0
+    ts = [f"2026-09-20T11:{i:02d}:00Z" for i in range(len(values))]
+
+    result = analyze_series(ts, values, window_size=20, min_window=5, threshold=3.0)
+    assert result["baseline_policy"] == "rolling"
+    assert result["rebase_after"] is None
+    assert result["baseline_rebuild_count"] == 0
+    assert all(
+        p["baseline_generation"] == 0 and p["baseline_reset"] is False
+        for p in result["points"]
+    )
+    print("✓ rolling 默认模式：结果与新增默认字段正确")
+
+
+def test_guarded_isolated_spike_excluded() -> None:
+    """guarded 模式：孤立尖刺不得进入后续基线，不触发重建。"""
+    values = [10.0 + (0.1 if i % 2 == 0 else -0.1) for i in range(30)]
+    values[10] = 20.0  # 孤立尖刺
+    ts = [f"2026-09-20T12:{i:02d}:00Z" for i in range(len(values))]
+
+    result = analyze_series(
+        ts, values, window_size=20, min_window=5, threshold=3.0,
+        baseline_policy="guarded",
+    )
+    assert result["baseline_policy"] == "guarded"
+    assert result["rebase_after"] == 5  # 默认取 min_window
+    assert result["baseline_rebuild_count"] == 0
+    assert [(s["start_index"], s["end_index"]) for s in result["segments"]] == [(10, 10)]
+
+    by_index = {p["index"]: p for p in result["points"]}
+    # 尖刺被排除：其后正常点的基线中位数仍贴近 10，离散度未被 20 放大
+    assert abs(by_index[11]["baseline_median"] - 10.0) < 0.2
+    assert by_index[11]["is_anomaly"] is False
+    assert by_index[10]["baseline_reset"] is False
+    assert all(p["baseline_generation"] == 0 for p in result["points"])
+
+    # 区间基线窗口不得包含被排除的尖刺：成员来自 0..9（5 个种子 + 5..9 正常点），
+    # 时间上界停在尖刺前一个点
+    seg = result["segments"][0]
+    assert seg["baseline"]["window_size"] == 10
+    assert seg["baseline"]["window_end_time"] == "2026-09-20T12:09:00Z"
+    print("✓ guarded 孤立尖刺：不污染后续中位数/离散度，且不触发重建")
+
+
+def test_guarded_rebuild_on_consecutive_anomalies() -> None:
+    """guarded 模式：连续异常达到 rebase_after 时重建基线、递增代次但不拆区间。"""
+    values = [10.0 + (0.1 if i % 2 == 0 else -0.1) for i in range(40)]
+    values[20:30] = [16.0] * 10  # 持续水平偏移
+    ts = [f"2026-09-20T13:{i:02d}:00Z" for i in range(len(values))]
+
+    result = analyze_series(
+        ts, values, window_size=20, min_window=5, threshold=3.0, merge_gap=2,
+        baseline_policy="guarded",
+    )
+    by_index = {p["index"]: p for p in result["points"]}
+
+    # 第 5 个连续异常点 i=24 触发重建；该点仍保持异常、区间不拆分
+    assert by_index[24]["baseline_reset"] is True
+    assert by_index[24]["is_anomaly"] is True
+    assert by_index[24]["baseline_generation"] == 0  # 评分用旧代次
+    assert result["baseline_rebuild_count"] >= 1
+    assert [(s["start_index"], s["end_index"]) for s in result["segments"]][0] == (20, 24)
+
+    # 重建后 i=25..29 对新基线（全 16）恢复正常，代次为 1
+    for i in range(25, 30):
+        assert by_index[i]["is_anomaly"] is False
+        assert by_index[i]["baseline_generation"] == 1
+        assert by_index[i]["baseline_reset"] is False
+
+    # 自定义 rebase_after（>= min_window）：首次重建延后到 i=26
+    custom = analyze_series(
+        ts, values, window_size=20, min_window=5, threshold=3.0,
+        baseline_policy="guarded", rebase_after=7,
+    )
+    assert custom["rebase_after"] == 7
+    resets = [p["index"] for p in custom["points"] if p["baseline_reset"]]
+    assert resets[0] == 26
+    print("✓ guarded 连续异常：达 rebase_after 重建基线并递增代次，触发点仍异常、区间不拆分")
+
+
 def test_api_end_to_end(tmp_db: str = "/tmp/tsad_smoke.db") -> None:
     import os
 
@@ -136,12 +219,51 @@ def _exercise_api(client: "TestClient") -> None:
     r = client.post("/api/v1/detections", json=bad)
     assert r.status_code == 422
 
-    print("✓ API 端到端测试通过：提交 / 查询 / 列表 / 404 / 参数校验")
+    # guarded 模式：回显策略与重建统计，逐点注解带代次/重建标记
+    guarded_payload = dict(payload)
+    guarded_payload["series_id"] = "test-series-guarded"
+    guarded_payload["baseline_policy"] = "guarded"
+    guarded_payload["rebase_after"] = 3
+    r = client.post("/api/v1/detections", json=guarded_payload)
+    assert r.status_code == 201, r.text
+    gbody = r.json()
+    assert gbody["baseline_policy"] == "guarded"
+    assert gbody["rebase_after"] == 3
+    assert "baseline_rebuild_count" in gbody
+    assert all(
+        "baseline_generation" in p and "baseline_reset" in p
+        for p in gbody["points"]
+    )
+    guarded_id = gbody["id"]
+
+    # 历史结果取回时策略字段持久化保留
+    r = client.get(f"/api/v1/detections/{guarded_id}")
+    assert r.status_code == 200
+    assert r.json()["baseline_policy"] == "guarded"
+    assert r.json()["baseline_rebuild_count"] == gbody["baseline_rebuild_count"]
+
+    # 参数校验：rebase_after < min_window
+    bad = dict(payload)
+    bad["baseline_policy"] = "guarded"
+    bad["min_window"], bad["rebase_after"] = 3, 2
+    r = client.post("/api/v1/detections", json=bad)
+    assert r.status_code == 422
+
+    # 参数校验：非法 baseline_policy
+    bad = dict(payload)
+    bad["baseline_policy"] = "strict"
+    r = client.post("/api/v1/detections", json=bad)
+    assert r.status_code == 422
+
+    print("✓ API 端到端测试通过：提交 / 查询 / 列表 / 404 / 参数校验 / guarded 策略")
 
 
 if __name__ == "__main__":
     test_algorithm_spikes_and_shift()
     test_constant_baseline()
     test_no_anomaly()
+    test_rolling_defaults_unchanged()
+    test_guarded_isolated_spike_excluded()
+    test_guarded_rebuild_on_consecutive_anomalies()
     test_api_end_to_end()
     print("\n全部冒烟测试通过 ✅")

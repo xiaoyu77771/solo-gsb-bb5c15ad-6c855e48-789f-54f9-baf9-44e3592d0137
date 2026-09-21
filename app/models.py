@@ -75,6 +75,22 @@ class DetectRequest(BaseModel):
         le=10_000,
         description="合并异常区间时允许桥接的连续正常点数",
     )
+    baseline_policy: Literal["rolling", "guarded"] = Field(
+        default="rolling",
+        description=(
+            "基线策略：rolling=所有历史点滑入基线（默认）；"
+            "guarded=仅正常点进入基线，连续异常达到 rebase_after 时重建基线"
+        ),
+    )
+    rebase_after: int | None = Field(
+        default=None,
+        ge=1,
+        le=10_000,
+        description=(
+            "guarded 模式下连续异常达到该点数即重建基线（默认取 min_window，"
+            "且不得小于 min_window）；rolling 模式忽略"
+        ),
+    )
     include_points: bool = Field(
         default=False, description="响应是否包含逐点注解（存储中始终保留）"
     )
@@ -88,6 +104,12 @@ class DetectRequest(BaseModel):
                 f"至少需要 {self.min_window + 1} 个点（min_window={self.min_window}），"
                 f"当前只有 {len(self.points)} 个"
             )
+        if self.baseline_policy == "guarded" and self.rebase_after is not None:
+            if self.rebase_after < self.min_window:
+                raise ValueError(
+                    f"rebase_after 不能小于 min_window"
+                    f"（rebase_after={self.rebase_after} < min_window={self.min_window}）"
+                )
         return self
 
 
@@ -149,6 +171,14 @@ class AnnotatedPoint(BaseModel):
     zscore: float
     degenerate_baseline: bool
     is_anomaly: bool
+    baseline_generation: int = Field(
+        default=0,
+        description="评分该点时使用的基线代次；guarded 模式每次重建递增，rolling 恒为 0",
+    )
+    baseline_reset: bool = Field(
+        default=False,
+        description="该点是否触发了基线重建（用其所在异常段末尾 min_window 个点重建）",
+    )
 
 
 class DetectSummary(BaseModel):
@@ -157,6 +187,9 @@ class DetectSummary(BaseModel):
     min_window: int
     threshold: float
     merge_gap: int
+    baseline_policy: Literal["rolling", "guarded"] = "rolling"
+    rebase_after: int | None = None
+    baseline_rebuild_count: int = Field(default=0, description="guarded 模式基线重建（代次递增）次数")
     evaluated_start_index: int
     evaluated_point_count: int
     anomaly_point_count: int
